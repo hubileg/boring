@@ -120,6 +120,7 @@ mod macros;
 mod bio;
 #[macro_use]
 mod util;
+pub mod aead;
 pub mod aes;
 pub mod asn1;
 pub mod base64;
@@ -137,12 +138,16 @@ pub mod hash;
 pub mod hmac;
 pub mod hpke;
 pub mod memcmp;
+#[cfg(feature = "mldsa")]
+pub mod mldsa;
 #[cfg(feature = "mlkem")]
 pub mod mlkem;
 pub mod nid;
 pub mod pkcs12;
 pub mod pkcs5;
 pub mod pkey;
+#[cfg(feature = "prf")]
+pub mod prf;
 pub mod rand;
 pub mod rsa;
 pub mod sha;
@@ -220,6 +225,8 @@ unsafe extern "C" fn free_data_box<T>(
     _argp: *mut c_void,
 ) {
     if !ptr.is_null() {
-        drop(Box::<T>::from_raw(ptr.cast::<T>()));
+        unsafe {
+            drop(Box::<T>::from_raw(ptr.cast::<T>()));
+        }
     }
 }

@@ -4,6 +4,7 @@ use std::fs;
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::process::{Command, Output};
 use std::sync::OnceLock;
 
@@ -16,7 +17,7 @@ fn should_use_cmake_cross_compilation(config: &Config) -> bool {
         return false;
     }
     match config.target_os.as_str() {
-        "macos" | "ios" => {
+        "macos" | "ios" | "tvos" => {
             // Cross-compiling for Apple platforms on macOS is supported using the normal Xcode
             // tools, along with the settings from `cmake_params_apple`.
             !config.host.ends_with("-darwin")
@@ -65,6 +66,31 @@ const CMAKE_PARAMS_APPLE: &[(&str, &[(&str, &str)])] = &[
         &[
             ("CMAKE_OSX_ARCHITECTURES", "x86_64"),
             ("CMAKE_OSX_SYSROOT", "iphonesimulator"),
+            ("CMAKE_MACOSX_BUNDLE", "OFF"),
+        ],
+    ),
+    // tvOS
+    (
+        "aarch64-apple-tvos",
+        &[
+            ("CMAKE_OSX_ARCHITECTURES", "arm64"),
+            ("CMAKE_OSX_SYSROOT", "appletvos"),
+            ("CMAKE_MACOSX_BUNDLE", "OFF"),
+        ],
+    ),
+    (
+        "aarch64-apple-tvos-sim",
+        &[
+            ("CMAKE_OSX_ARCHITECTURES", "arm64"),
+            ("CMAKE_OSX_SYSROOT", "appletvsimulator"),
+            ("CMAKE_MACOSX_BUNDLE", "OFF"),
+        ],
+    ),
+    (
+        "x86_64-apple-tvos",
+        &[
+            ("CMAKE_OSX_ARCHITECTURES", "x86_64"),
+            ("CMAKE_OSX_SYSROOT", "appletvsimulator"),
             ("CMAKE_MACOSX_BUNDLE", "OFF"),
         ],
     ),
@@ -298,12 +324,19 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
             boringssl_cmake.cflag(&cflag);
         }
 
-        "windows" => {
-            if config.host.contains("windows") {
-                // BoringSSL's CMakeLists.txt isn't set up for cross-compiling using Visual Studio.
-                // Disable assembly support so that it at least builds.
-                boringssl_cmake.define("OPENSSL_NO_ASM", "YES");
+        "tvos" => {
+            // Unlike the `ios` arm above, no bitcode flag: bitcode was deprecated in
+            // Xcode 14 and the tvOS targets postdate it, so the SDK never wants it.
+            for (name, value) in cmake_params_apple(config) {
+                eprintln!("tvos arch={} add {}={}", config.target_arch, name, value);
+                boringssl_cmake.define(name, value);
             }
+        }
+
+        "windows" if config.host.contains("windows") => {
+            // BoringSSL's CMakeLists.txt isn't set up for cross-compiling using Visual Studio.
+            // Disable assembly support so that it at least builds.
+            boringssl_cmake.define("OPENSSL_NO_ASM", "YES");
         }
 
         "linux" => match &*config.target_arch {
@@ -351,7 +384,7 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
     boringssl_cmake
 }
 
-fn pick_best_android_ndk_toolchain(toolchains_dir: &Path) -> std::io::Result<OsString> {
+fn pick_best_android_ndk_toolchain(toolchains_dir: &Path) -> io::Result<OsString> {
     let toolchains = std::fs::read_dir(toolchains_dir)?.collect::<Result<Vec<_>, _>>()?;
     // First look for one of the toolchains that Google has documented.
     // https://developer.android.com/ndk/guides/other_build_systems
@@ -383,7 +416,7 @@ fn get_extra_clang_args_for_bindgen(config: &Config) -> Vec<String> {
 
     // Add platform-specific parameters.
     match &*config.target_os {
-        "ios" | "macos" => {
+        "ios" | "macos" | "tvos" => {
             // When cross-compiling for Apple targets, tell bindgen to use SDK sysroot,
             // and *don't* use system headers of the host macOS.
             let sdk = get_apple_sdk_name(config);
@@ -436,12 +469,14 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
         );
         return Ok(());
     } else if config.env.source_path.is_some()
-        && (config.features.rpk || config.features.underscore_wildcards)
+        && (config.features.rpk
+            || config.features.underscore_wildcards
+            || config.features.relax_cert_validation)
     {
         panic!(
             "BORING_BSSL_ASSUME_PATCHED must be set when setting
                BORING_BSSL_SOURCE_PATH and using any of the following
-               features: rpk, underscore-wildcards"
+               features: rpk, underscore-wildcards, relax-cert-validation"
         );
     }
 
@@ -456,6 +491,14 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
         run_command(Command::new("git").arg("init").current_dir(src_path))?;
     }
 
+    if config.features.allow_crl_extensions_bad_version {
+        println!(
+            "cargo:warning=applying the patch for disabling cert version \
+            validation for extensions"
+        );
+        apply_patch(config, "bad-cert-verification.patch")?;
+    }
+
     println!("cargo:warning=applying post quantum crypto patch to boringssl");
     apply_patch(config, "boring-pq.patch")?;
 
@@ -467,6 +510,11 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
     if config.features.underscore_wildcards {
         println!("cargo:warning=applying underscore wildcards patch to boringssl");
         apply_patch(config, "underscore-wildcards.patch")?;
+    }
+
+    if config.features.relax_cert_validation {
+        println!("cargo:warning=applying RSA key-usage enforcement relaxation patch");
+        apply_patch(config, "relax-cert-validation.patch")?;
     }
 
     Ok(())
@@ -573,20 +621,79 @@ fn get_cpp_runtime_lib(config: &Config) -> Option<String> {
     }
 
     match &*config.target_os {
-        "macos" | "ios" | "freebsd" | "openbsd" | "android" => Some("c++".into()),
+        "macos" | "ios" | "tvos" | "freebsd" | "openbsd" | "android" => Some("c++".into()),
         _ if config.unix || config.target_env == "gnu" => Some("stdc++".into()),
         // TODO(rmehra): figure out how to do this for windows
         _ => None,
     }
 }
 
-fn main() {
-    let config = Config::from_env();
-    ensure_patches_applied(&config).unwrap();
+/// Copies built BoringSSL artifacts (libraries and patched headers) into a
+/// user-specified directory. This is intended for producing a pre-built package.
+///
+/// The destination directory must exist and be empty. Writes:
+///
+///   - `lib/libcrypto.a`
+///   - `lib/libssl.a`
+///   - `lib/bcm.o` (if FIPS is enabled)
+///   - `include/openssl/...` (patched headers)
+fn install_artifacts(
+    config: &Config,
+    install_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let install_dir = match install_dir.canonicalize() {
+        Ok(dir) if dir.read_dir().is_ok_and(|mut d| d.next().is_none()) => dir,
+        dir => {
+            let path = dir.as_deref().unwrap_or(install_dir).display();
+            return Err(format!("{path} must be an empty dir").into());
+        }
+    };
+    let bssl_build_dir = build_boringssl_or_get_prebuilt(config);
+
+    let lib_dir = install_dir.join("lib");
+    fs::create_dir(&lib_dir)?;
+
+    for lib in ["libcrypto.a", "libssl.a", "bcm.o"] {
+        if !config.features.fips && lib == "bcm.o" {
+            continue;
+        }
+        fs::copy(bssl_build_dir.join(lib), lib_dir.join(lib))?;
+    }
+
+    fs_extra::dir::copy(get_include_path(config)?, &install_dir, &Default::default())?;
+
+    eprintln!(
+        "installed BoringSSL artifacts into {}",
+        install_dir.display()
+    );
+    Ok(())
+}
+
+fn main() -> ExitCode {
+    if let Err(e) = run() {
+        eprintln!("boring-sys failed: {e}");
+        println!(
+            "cargo::error={}",
+            e.to_string().trim_ascii().replace('\n', "\ncargo::error=")
+        );
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let config = Config::from_env()?;
+    ensure_patches_applied(&config)?;
     if !config.env.docs_rs {
         emit_link_directives(&config);
     }
-    generate_bindings(&config);
+    generate_bindings(&config).map_err(|e| format!("could not generate bindings: {e}"))?;
+    if let Some(install_dir) = &config.env.export_to_install_dir {
+        install_artifacts(&config, install_dir)
+            .map_err(|e| format!("install artifacts failed: {e}"))?;
+    }
+    Ok(())
 }
 
 fn emit_link_directives(config: &Config) {
@@ -637,21 +744,25 @@ fn check_include_path(path: PathBuf) -> Result<PathBuf, String> {
     }
 }
 
-fn generate_bindings(config: &Config) {
-    let include_path = config.env.include_path.clone().unwrap_or_else(|| {
-        if let Some(bssl_path) = &config.env.path {
-            return check_include_path(bssl_path.join("include"))
-                .expect("config has invalid include path");
-        }
+fn get_include_path(config: &Config) -> Result<PathBuf, String> {
+    if let Some(path) = &config.env.include_path {
+        return check_include_path(path.to_owned());
+    }
 
-        let src_path = get_boringssl_source_path(config);
-        check_include_path(src_path.join("include"))
-            .or_else(|_| check_include_path(src_path.join("src").join("include")))
-            .expect("can't find usable include path")
-    });
+    if let Some(bssl_path) = &config.env.path {
+        return check_include_path(bssl_path.join("include"));
+    }
 
-    let target_rust_version =
-        bindgen::RustTarget::stable(77, 0).expect("bindgen does not recognize target rust version");
+    let src_path = get_boringssl_source_path(config);
+    check_include_path(src_path.join("include"))
+        .or_else(|_| check_include_path(src_path.join("src").join("include")))
+}
+
+fn generate_bindings(config: &Config) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let include_path = get_include_path(config)?;
+
+    let target_rust_version = bindgen::RustTarget::stable(77, 0)
+        .map_err(|e| format!("bindgen does not recognize target rust version: {e}"))?;
 
     let mut builder = bindgen::Builder::default()
         .rust_target(target_rust_version) // bindgen MSRV is 1.70, so this is enough
@@ -669,6 +780,7 @@ fn generate_bindings(config: &Config) {
         .fit_macro_constants(false)
         .size_t_is_usize(true)
         .layout_tests(config.env.debug.is_some())
+        .merge_extern_blocks(true)
         .prepend_enum_name(true)
         .blocklist_type("max_align_t") // Not supported by bindgen on all targets, not used by BoringSSL
         .clang_args(get_extra_clang_args_for_bindgen(config))
@@ -718,6 +830,7 @@ fn generate_bindings(config: &Config) {
         "hrss.h",
         "md4.h",
         "md5.h",
+        "mldsa.h",
         "mlkem.h",
         "obj_mac.h",
         "objects.h",
@@ -735,21 +848,27 @@ fn generate_bindings(config: &Config) {
             builder = builder.header(header_path.to_str().unwrap());
         } else {
             let err = format!("'openssl/{header}' is missing from '{}'. The include path may be incorrect or contain an outdated version of OpenSSL/BoringSSL", include_path.display());
-            let required = i < must_have_headers.len();
-            println!(
-                "cargo::{}={err}",
-                if required { "error" } else { "warning" }
-            );
+            if i < must_have_headers.len() {
+                return Err(err.into());
+            }
+            println!("cargo::warning={err}");
         }
     }
 
-    let bindings = builder.generate().expect("Unable to generate bindings");
+    let bindings = builder.generate()?;
     let mut source_code = Vec::new();
     bindings
         .write(Box::new(&mut source_code))
-        .expect("Couldn't serialize bindings!");
+        .map_err(|e| format!("Couldn't serialize bindings: {e}"))?;
     ensure_err_lib_enum_is_named(&mut source_code);
-    fs::write(config.out_dir.join("bindings.rs"), source_code).expect("Couldn't write bindings!");
+    let bindings_path = config.out_dir.join("bindings.rs");
+    fs::write(&bindings_path, source_code).map_err(|e| {
+        format!(
+            "Couldn't write bindings to {}: {e}",
+            bindings_path.display()
+        )
+    })?;
+    Ok(bindings_path)
 }
 
 /// err.h has anonymous `enum { ERR_LIB_NONE = 1 }`, which makes a dodgy `_bindgen_ty_1` name

@@ -14,7 +14,8 @@ use crate::srtp::SrtpProfileId;
 use crate::ssl::test::server::Server;
 use crate::ssl::{
     self, ExtensionType, ShutdownResult, ShutdownState, Ssl, SslAcceptor, SslAcceptorBuilder,
-    SslConnector, SslContext, SslFiletype, SslMethod, SslOptions, SslStream, SslVerifyMode,
+    SslConnector, SslContext, SslFiletype, SslInfoCallbackMode, SslMethod, SslOptions,
+    SslSignatureAlgorithm, SslStream, SslVerifyMode,
 };
 use crate::ssl::{HandshakeError, SslVersion};
 use crate::x509::store::X509StoreBuilder;
@@ -231,6 +232,53 @@ fn test_connect_with_srtp_ssl() {
     let buf2 = guard.join().unwrap();
 
     assert_eq!(buf[..], buf2[..]);
+}
+
+/// Tests that DTLS 1.3 can be enabled and negotiated successfully.
+#[test]
+fn test_dtls_1_3_version() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let guard = thread::spawn(move || {
+        let stream = listener.accept().unwrap().0;
+        let mut ctx = SslContext::builder(SslMethod::dtls()).unwrap();
+        ctx.set_certificate_file(Path::new("test/cert.pem"), SslFiletype::PEM)
+            .unwrap();
+        ctx.set_private_key_file(Path::new("test/key.pem"), SslFiletype::PEM)
+            .unwrap();
+        // Enable DTLS 1.3
+        ctx.set_max_proto_version(Some(SslVersion::DTLS1_3))
+            .unwrap();
+        let mut ssl = Ssl::new(&ctx.build()).unwrap();
+        ssl.set_mtu(1500).unwrap();
+        let stream = ssl.accept(stream).unwrap();
+
+        // Verify DTLS 1.3 was negotiated
+        let version = stream.ssl().version2().unwrap();
+        assert_eq!(version, SslVersion::DTLS1_3);
+
+        stream
+    });
+
+    let stream = TcpStream::connect(addr).unwrap();
+    let mut ctx = SslContext::builder(SslMethod::dtls()).unwrap();
+    // Enable DTLS 1.3 on client
+    ctx.set_max_proto_version(Some(SslVersion::DTLS1_3))
+        .unwrap();
+    let mut ssl = Ssl::new(&ctx.build()).unwrap();
+    ssl.set_mtu(1500).unwrap();
+    let stream = ssl.connect(stream).unwrap();
+
+    // Verify DTLS 1.3 was negotiated on client side
+    let version = stream.ssl().version2().unwrap();
+    assert_eq!(version, SslVersion::DTLS1_3);
+
+    // Also check version string
+    let version_str = stream.ssl().version_str();
+    assert_eq!(version_str, "DTLSv1.3");
+
+    guard.join().unwrap();
 }
 
 /// Tests that when the `SslStream` is created as a server stream, the protocols
@@ -1026,6 +1074,51 @@ fn get_curve() {
 }
 
 #[test]
+fn used_hello_retry_request_true() {
+    let mut server_builder = Server::builder();
+    // Configures the server to prefer it's options over the client
+    server_builder
+        .ctx()
+        .set_options(SslOptions::CIPHER_SERVER_PREFERENCE);
+    server_builder
+        .ctx()
+        .set_curves_list("P-256:X25519")
+        .unwrap();
+    let server = server_builder.build();
+    let mut client_builder = server.client_with_root_ca();
+    // configures the client to send this supported groups
+    client_builder
+        .ctx()
+        .set_curves_list("X25519:P-256")
+        .unwrap();
+
+    let client_stream = client_builder.connect();
+    let ssl = client_stream.ssl();
+    assert!(ssl.used_hello_retry_request());
+}
+
+#[test]
+fn used_hello_retry_request_false() {
+    let mut server_builder = Server::builder();
+    // Server doesn't configure CIPHER_SERVER_PREFERENCE, so it will use the preference of the client
+    server_builder
+        .ctx()
+        .set_curves_list("P-256:X25519")
+        .unwrap();
+    let server = server_builder.build();
+    let mut client_builder = server.client_with_root_ca();
+    // configures the client to send this supported groups
+    client_builder
+        .ctx()
+        .set_curves_list("X25519:P-256")
+        .unwrap();
+
+    let client_stream = client_builder.connect();
+    let ssl = client_stream.ssl();
+    assert!(!ssl.used_hello_retry_request());
+}
+
+#[test]
 fn test_get_ciphers() {
     let ctx_builder = SslContext::builder(SslMethod::tls()).unwrap();
     let ctx_builder_ciphers: Vec<&str> = ctx_builder
@@ -1222,4 +1315,193 @@ fn ex_data_drop() {
     drop(ctx2);
     assert_eq!(102, d1.load(Relaxed));
     assert_eq!(202, d2.load(Relaxed));
+}
+
+#[test]
+fn peer_signature_algorithm() {
+    // Default handshake: client should observe the server's CertificateVerify signature.
+    let server = Server::builder().build();
+    let s = server.client().connect();
+    let sigalg = s.ssl().peer_signature_algorithm();
+    assert!(
+        sigalg.is_some(),
+        "client should see peer (server) signature algorithm after handshake",
+    );
+    assert!(
+        sigalg.unwrap().name().is_some(),
+        "peer signature algorithm should have a resolvable name",
+    );
+}
+
+#[test]
+fn peer_signature_algorithm_mtls_server_sees_client() {
+    // Server requires a client certificate; verify that the server-side SslRef
+    // surfaces the client's CertificateVerify signature scheme as its peer sig alg.
+    // Observe from a server-side HANDSHAKE_DONE info callback so the capture
+    // happens synchronously during the server's accept, before the client's
+    // connect() returns.
+    let captured = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let mut server_builder = Server::builder();
+    {
+        let mut store = X509StoreBuilder::new().unwrap();
+        store.add_cert(X509::from_pem(ROOT_CERT).unwrap()).unwrap();
+        server_builder
+            .ctx()
+            .set_verify_cert_store(store.build())
+            .unwrap();
+        server_builder.ctx().set_verify(SslVerifyMode::PEER);
+        let captured_cb = std::sync::Arc::clone(&captured);
+        server_builder
+            .ctx()
+            .set_info_callback(move |ssl, mode, _value| {
+                if mode == SslInfoCallbackMode::HANDSHAKE_DONE {
+                    if let Some(sa) = ssl.peer_signature_algorithm() {
+                        assert!(sa.name().is_some(), "client sig scheme should have a name");
+                        captured_cb.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            });
+    }
+    let server = server_builder.build();
+
+    let mut client_builder = server.client_with_root_ca();
+    client_builder
+        .ctx()
+        .set_certificate_chain_file("test/cert.pem")
+        .unwrap();
+    client_builder
+        .ctx()
+        .set_private_key_file("test/key.pem", SslFiletype::PEM)
+        .unwrap();
+    let _ = client_builder.connect();
+
+    assert!(
+        captured.load(std::sync::atomic::Ordering::SeqCst),
+        "server should observe client signature scheme during mTLS",
+    );
+}
+
+#[test]
+fn signature_algorithm_used_server_default() {
+    // BoringSSL only retains signature_algorithm_used during the handshake, so we
+    // capture it from a HANDSHAKE_DONE info callback.
+    let captured = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let mut server_builder = Server::builder();
+    {
+        let captured_cb = std::sync::Arc::clone(&captured);
+        server_builder
+            .ctx()
+            .set_info_callback(move |ssl, mode, _value| {
+                if mode == SslInfoCallbackMode::HANDSHAKE_DONE {
+                    if let Some(sa) = ssl.signature_algorithm_used() {
+                        assert!(sa.name().is_some());
+                        captured_cb.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            });
+    }
+    let server = server_builder.build();
+    let _ = server.client_with_root_ca().connect();
+
+    assert!(
+        captured.load(std::sync::atomic::Ordering::SeqCst),
+        "server should observe signature_algorithm_used at HANDSHAKE_DONE",
+    );
+}
+
+#[test]
+fn signature_algorithm_used_post_handshake_returns_none() {
+    // BoringSSL drops the value after the handshake. Confirm the binding
+    // surfaces that contract: calling on the client SslStream post-handshake
+    // returns None.
+    let server = Server::builder().build();
+    let s = server.client_with_root_ca().connect();
+    assert!(
+        s.ssl().signature_algorithm_used().is_none(),
+        "BoringSSL discards signature_algorithm_used after handshake",
+    );
+}
+
+#[test]
+fn signature_algorithm_used_mtls_client() {
+    // Client side mTLS: capture the sig scheme the client used in CertificateVerify.
+    let mut server_builder = Server::builder();
+    {
+        let mut store = X509StoreBuilder::new().unwrap();
+        store.add_cert(X509::from_pem(ROOT_CERT).unwrap()).unwrap();
+        server_builder
+            .ctx()
+            .set_verify_cert_store(store.build())
+            .unwrap();
+        server_builder.ctx().set_verify(SslVerifyMode::PEER);
+    }
+    let server = server_builder.build();
+
+    let captured = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let captured_cb = std::sync::Arc::clone(&captured);
+
+    let mut client_builder = server.client_with_root_ca();
+    client_builder
+        .ctx()
+        .set_certificate_chain_file("test/cert.pem")
+        .unwrap();
+    client_builder
+        .ctx()
+        .set_private_key_file("test/key.pem", SslFiletype::PEM)
+        .unwrap();
+    client_builder
+        .ctx()
+        .set_info_callback(move |ssl, mode, _value| {
+            if mode == SslInfoCallbackMode::HANDSHAKE_DONE {
+                if let Some(sa) = ssl.signature_algorithm_used() {
+                    assert!(sa.name().is_some());
+                    captured_cb.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        });
+    let _ = client_builder.connect();
+
+    assert!(
+        captured.load(std::sync::atomic::Ordering::SeqCst),
+        "client should observe signature_algorithm_used at HANDSHAKE_DONE in mTLS",
+    );
+}
+
+// ===========================================================================
+// per-connection verify algorithm prefs
+// ===========================================================================
+
+#[test]
+fn set_verify_algorithm_prefs_ssl_accepts_matching() {
+    // Client restricts verify prefs to a scheme the server can satisfy.
+    let server = Server::builder().build();
+
+    let client_builder = server.client();
+    let mut ssl_builder = client_builder.build().builder();
+    ssl_builder
+        .ssl()
+        .set_verify_algorithm_prefs(&[SslSignatureAlgorithm::RSA_PSS_RSAE_SHA256])
+        .expect("verify prefs should be accepted");
+    let s = ssl_builder.connect();
+    let sa = s.ssl().peer_signature_algorithm().unwrap();
+    assert_eq!(sa, SslSignatureAlgorithm::RSA_PSS_RSAE_SHA256);
+}
+
+#[test]
+fn set_verify_algorithm_prefs_ssl_rejects_unsatisfiable() {
+    // Client restricts verify prefs to a scheme the server's RSA cert cannot
+    // satisfy. The handshake must fail.
+    let mut server_builder = Server::builder();
+    server_builder.should_error();
+    let server = server_builder.build();
+
+    let client_builder = server.client();
+    let mut ssl_builder = client_builder.build().builder();
+    ssl_builder
+        .ssl()
+        .set_verify_algorithm_prefs(&[SslSignatureAlgorithm::ED25519])
+        .expect("verify prefs should be accepted by setter");
+    let _err = ssl_builder.connect_err();
 }

@@ -21,6 +21,8 @@ pub(crate) struct Features {
     pub(crate) fips: bool,
     pub(crate) rpk: bool,
     pub(crate) underscore_wildcards: bool,
+    pub(crate) allow_crl_extensions_bad_version: bool,
+    pub(crate) relax_cert_validation: bool,
 }
 
 pub(crate) struct Env {
@@ -36,12 +38,17 @@ pub(crate) struct Env {
     pub(crate) cmake_toolchain_file: Option<PathBuf>,
     pub(crate) cpp_runtime_lib: Option<OsString>,
     pub(crate) docs_rs: bool,
+    /// If set, built artifacts (libraries and patched headers) will be copied
+    /// into this directory. The directory must exist and be empty.
+    pub(crate) export_to_install_dir: Option<PathBuf>,
 }
 
 impl Config {
-    pub(crate) fn from_env() -> Self {
-        let manifest_dir = env::var_os("CARGO_MANIFEST_DIR").unwrap().into();
-        let out_dir = env::var_os("OUT_DIR").unwrap().into();
+    pub(crate) fn from_env() -> Result<Self, &'static str> {
+        let manifest_dir = env::var_os("CARGO_MANIFEST_DIR")
+            .ok_or("CARGO_MANIFEST_DIR")?
+            .into();
+        let out_dir = env::var_os("OUT_DIR").ok_or("OUT_DIR")?.into();
         let host = env::var("HOST").unwrap();
         let target = env::var("TARGET").unwrap();
         let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
@@ -63,6 +70,12 @@ impl Config {
             .as_ref()
             .is_some_and(|path| path.join("src").exists());
 
+        // DEP_BORINGSSL_VERSION_MAJOR
+        println!(
+            "cargo:version_major={}",
+            env::var("CARGO_PKG_VERSION_MAJOR").unwrap_or_default()
+        );
+
         let config = Self {
             manifest_dir,
             out_dir,
@@ -78,14 +91,14 @@ impl Config {
             env,
         };
 
-        config.check_feature_compatibility();
+        config.check_feature_compatibility()?;
 
-        config
+        Ok(config)
     }
 
-    fn check_feature_compatibility(&self) {
+    fn check_feature_compatibility(&self) -> Result<(), &'static str> {
         if self.features.fips && self.features.rpk {
-            panic!("`fips` and `rpk` features are mutually exclusive");
+            return Err("`fips` and `rpk` features are mutually exclusive");
         }
 
         let is_precompiled_native_lib = self.env.path.is_some();
@@ -93,13 +106,15 @@ impl Config {
             !is_precompiled_native_lib && self.env.source_path.is_none();
 
         if self.env.assume_patched && is_external_native_lib_source {
-            panic!(
+            return Err(
                 "`BORING_BSSL_{{,_FIPS}}_ASSUME_PATCHED` env variable is supposed to be used with\
-                `BORING_BSSL{{,_FIPS}}_PATH` or `BORING_BSSL{{,_FIPS}}_SOURCE_PATH` env variables"
+                `BORING_BSSL{{,_FIPS}}_PATH` or `BORING_BSSL{{,_FIPS}}_SOURCE_PATH` env variables",
             );
         }
 
-        let features_with_patches_enabled = self.features.rpk || self.features.underscore_wildcards;
+        let features_with_patches_enabled = self.features.rpk
+            || self.features.underscore_wildcards
+            || self.features.relax_cert_validation;
 
         let patches_required = features_with_patches_enabled && !self.env.assume_patched;
 
@@ -108,19 +123,22 @@ impl Config {
                 "cargo:warning=precompiled BoringSSL was provided, so patches will be ignored"
             );
         }
+
+        if self.env.export_to_install_dir.is_some() && is_precompiled_native_lib {
+            return Err("`BORING_BSSL{{,_FIPS_}}INSTALL_DIR` cannot be used together with a precompiled library");
+        }
+        Ok(())
     }
 }
 
 impl Features {
     fn from_env() -> Self {
-        let fips = env::var_os("CARGO_FEATURE_FIPS").is_some();
-        let rpk = env::var_os("CARGO_FEATURE_RPK").is_some();
-        let underscore_wildcards = env::var_os("CARGO_FEATURE_UNDERSCORE_WILDCARDS").is_some();
-
         Self {
-            fips,
-            rpk,
-            underscore_wildcards,
+            fips: cfg!(feature = "fips"),
+            rpk: cfg!(feature = "rpk"),
+            underscore_wildcards: cfg!(feature = "underscore-wildcards"),
+            allow_crl_extensions_bad_version: cfg!(feature = "allow-crl-extensions-bad-version"),
+            relax_cert_validation: cfg!(feature = "relax-cert-validation"),
         }
     }
 
@@ -180,6 +198,7 @@ impl Env {
             cmake_toolchain_file: target_var("CMAKE_TOOLCHAIN_FILE").map(Into::into),
             cpp_runtime_lib: target_var("BORING_BSSL_RUST_CPPLIB"),
             docs_rs: var("DOCS_RS").is_some(),
+            export_to_install_dir: boringssl_var("BORING_BSSL_INSTALL_DIR").map(PathBuf::from),
         }
     }
 }
